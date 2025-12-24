@@ -1,0 +1,937 @@
+---
+simd: 'XXXX'
+title: Account Guardians for System Accounts
+authors:
+  - [Your Name]
+  - [Technical Collaborator - TBD]
+category: Standard
+type: Core
+status: Draft
+created: 2025-XX-XX
+---
+
+## Summary
+
+This proposal introduces an opt-in guardian mechanism for System-owned accounts (standard Solana wallets). Users can register a secondary keypair ("guardian") that has the authority to initiate account recovery in the event of primary key compromise. The mechanism includes timelocks and dispute windows to prevent abuse while preserving address continuity.
+
+This proposal explicitly:
+- Requires no action from users who do not wish to participate
+- Adds zero overhead to non-participating accounts
+- Does not change existing wallet behavior
+- Does not introduce custodial trust assumptions
+
+---
+
+## Motivation
+
+### The Problem
+
+Every Solana wallet created today faces the same fundamental vulnerability that existed at network launch: a single keypair controls the account with no recovery path.
+
+If a user:
+- Loses their seed phrase → funds are permanently inaccessible
+- Has their seed phrase compromised → funds can be drained with no recourse
+
+There is no on-chain mechanism to recover, freeze, or transfer ownership of a standard Solana wallet.
+
+### Scale of the Problem
+
+[DATA NEEDED: Community input requested]
+
+- Estimated number of Solana wallets compromised annually
+- Estimated value lost to seed phrase compromise
+- Estimated value lost to seed phrase loss
+- Survey data from wallet providers on support ticket volume related to recovery
+
+This data will strengthen the case for protocol-level intervention versus leaving the problem to application-layer solutions.
+
+### Current State
+
+Standard Solana wallets (System-owned accounts) are cryptographically simple:
+
+- Address is derived from the public key
+- Control is determined solely by possession of the private key
+- The blockchain only validates: "Is this a valid ed25519 signature?"
+- No on-chain logic, state, or upgrade path exists
+
+This model offers no protection against:
+- Seed phrase theft (phishing, malware, physical theft)
+- Seed phrase loss (hardware failure, death, disaster)
+- Social engineering attacks
+
+### Why Address Preservation Matters
+
+Users cannot simply "migrate to a better wallet" because:
+
+- .sol domains are tied to their address
+- Exchange whitelists reference their address
+- DAO memberships and governance rights are address-bound
+- NFT provenance and creator royalties reference original addresses
+- Airdrop eligibility is often based on historical address activity
+- Social reputation is tied to on-chain identity
+
+While these associations can technically be updated, the friction is significant:
+
+- .sol domain transfer requires transaction from compromised wallet (impossible if compromised)
+- Exchange whitelists require support tickets and verification delays
+- DAO membership migration may require governance votes
+- NFT provenance is permanently tied to original creator address
+- Airdrop eligibility cannot be retroactively transferred
+- On-chain reputation and history cannot be migrated
+
+Asking users to migrate to a Program Derived Address (PDA) or smart contract wallet means abandoning their established on-chain identity.
+
+### Competitive Landscape
+
+Ethereum has recognized this problem and is actively solving it:
+
+| Standard | Description | Status |
+|----------|-------------|--------|
+| EIP-4337 | Account abstraction via smart contract wallets | Live |
+| EIP-7702 | Allows EOAs to temporarily adopt smart contract code | Shipping with Pectra |
+
+These standards enable Ethereum users to add recovery mechanisms, social guardians, and spending limits to existing addresses.
+
+Solana has no equivalent roadmap. Users creating wallets today have the same security model as users in 2020.
+
+**Note on "Ethereum envy":** This proposal does not suggest Solana should copy Ethereum's approach. The architectures are fundamentally different. However, the user problem is identical across chains, and Solana users deserve a Solana-native solution. The competitive comparison is included to demonstrate industry recognition that this problem requires protocol-level solutions.
+
+### Why Now
+
+- Solana adoption is accelerating across retail and institutional users
+- High-profile wallet compromises continue to make headlines
+- Competing chains are shipping account abstraction features
+- The longer Solana waits, the more users are locked into vulnerable accounts
+- Institutional adoption requires security guarantees beyond "don't lose your seed phrase"
+
+### Why Protocol-Level
+
+A common counterargument is: "Let the market solve it with smart contract wallets."
+
+This proposal argues for protocol-level implementation because:
+
+1. **Application-layer solutions are not enforceable.** Wallet applications can implement guardian checks, but attackers can bypass compliant wallets using CLI tools, custom scripts, or any raw signing tool. The blockchain only validates signatures, not application logic.
+
+2. **Smart contract wallets require migration.** Existing solutions (Squads, Fuse) require users to move to a new address. This proposal enables recovery on existing addresses.
+
+3. **Fragmentation creates confusion.** Multiple competing application-layer solutions create inconsistent user experiences and security guarantees. A protocol-level standard provides uniformity.
+
+4. **Wallet providers can build on protocol primitives.** Rather than each wallet implementing proprietary recovery, all wallets can leverage the same underlying mechanism, reducing development burden and increasing auditability.
+
+### User Stories
+
+**Story 1: Phishing Compromise**
+A user clicks a malicious link and unknowingly signs a transaction that exposes their seed phrase. By the time they realize, their wallet is drained. With a guardian registered, they could have initiated recovery from their secure key wallet, freezing the account and transferring ownership to a new keypair.
+
+**Story 2: Inheritance**
+A user passes away unexpectedly. Their family knows about their crypto holdings but has no access to the seed phrase stored on an encrypted device. With a guardian key held by a trusted family member or attorney, recovery could be initiated after appropriate verification.
+
+**Story 3: Lost Seed Phrase**
+A user's hardware wallet fails and their metal seed backup is destroyed in a house fire. With no guardian, the funds are permanently lost. A registered guardian could recover the account to a new keypair.
+
+**Story 4: Proactive Security**
+A security-conscious user wants defense in depth. They register a guardian key stored on a hardware wallet in a bank safe deposit box. Their daily-use wallet remains convenient, but catastrophic loss is no longer possible.
+
+**Story 5: Institutional Requirement**
+A company treasury requires multi-party control for compliance. Rather than migrating to a multi-sig (new address), they register a guardian key held by the CFO, enabling recovery if the primary operator is unavailable.
+
+---
+
+## New Terminology
+
+| Term | Definition |
+|------|------------|
+| **Guardian** | A secondary keypair registered to a System-owned account with authority to initiate recovery |
+| **Primary Key** | The original keypair that controls the account (standard wallet keypair) |
+| **Key Wallet** | Colloquial term for the wallet holding the guardian keypair |
+| **Transactional Wallet** | Colloquial term for the user's daily-use wallet (primary key) |
+| **Activation Delay** | Mandatory waiting period after guardian registration before the guardian becomes active |
+| **Recovery Timelock** | Mandatory waiting period between recovery initiation and finalization |
+| **Contested State** | Account state during an active recovery attempt |
+| **Recovery Initiation** | Guardian-signed transaction that begins the recovery process |
+| **Recovery Finalization** | Guardian-signed transaction that completes ownership transfer after timelock |
+| **Recovery Cancellation** | Primary key-signed transaction that aborts an active recovery attempt |
+
+---
+
+## Proposed Solution
+
+### High-Level Mechanism
+
+1. A native program (Guardian Registry) is added to the Solana runtime
+2. Users can register a guardian keypair to their existing account
+3. Registration requires signing with the primary key
+4. A mandatory activation delay prevents attackers from racing to register their own guardian
+5. Once active, the guardian can initiate recovery if the primary key is compromised
+6. Recovery includes a timelock during which the primary key can cancel (false alarm protection)
+7. After timelock expires, the guardian can finalize recovery, transferring account ownership to a new keypair
+
+### Design Principles
+
+1. **Minimal scope:** Guardians can only initiate recovery. No spending limits, transaction approval, or other features. Scope creep is explicitly rejected.
+
+2. **Opt-in only:** Zero impact on non-participating accounts.
+
+3. **Self-custodial:** No third-party trust assumptions. Both keys are controlled by the user (or their designated trusted parties).
+
+4. **Reversible:** False alarm recovery attempts can be cancelled by the primary key.
+
+5. **Simple:** One guardian per account (initially). Complexity invites bugs.
+
+### User Flow: Registration
+```markdown
+---
+simd: 'XXXX'
+title: Account Guardians for System Accounts
+authors:
+  - [Your Name]
+  - [Technical Collaborator - TBD]
+category: Standard
+type: Core
+status: Draft
+created: 2025-XX-XX
+---
+
+## Summary
+
+This proposal introduces an opt-in guardian mechanism for System-owned accounts (standard Solana wallets). Users can register a secondary keypair ("guardian") that has the authority to initiate account recovery in the event of primary key compromise. The mechanism includes timelocks and dispute windows to prevent abuse while preserving address continuity.
+
+This proposal explicitly:
+- Requires no action from users who do not wish to participate
+- Adds zero overhead to non-participating accounts
+- Does not change existing wallet behavior
+- Does not introduce custodial trust assumptions
+
+---
+
+## Motivation
+
+### The Problem
+
+Every Solana wallet created today faces the same fundamental vulnerability that existed at network launch: a single keypair controls the account with no recovery path.
+
+If a user:
+- Loses their seed phrase → funds are permanently inaccessible
+- Has their seed phrase compromised → funds can be drained with no recourse
+
+There is no on-chain mechanism to recover, freeze, or transfer ownership of a standard Solana wallet.
+
+### Scale of the Problem
+
+[DATA NEEDED: Community input requested]
+
+- Estimated number of Solana wallets compromised annually
+- Estimated value lost to seed phrase compromise
+- Estimated value lost to seed phrase loss
+- Survey data from wallet providers on support ticket volume related to recovery
+
+This data will strengthen the case for protocol-level intervention versus leaving the problem to application-layer solutions.
+
+### Current State
+
+Standard Solana wallets (System-owned accounts) are cryptographically simple:
+
+- Address is derived from the public key
+- Control is determined solely by possession of the private key
+- The blockchain only validates: "Is this a valid ed25519 signature?"
+- No on-chain logic, state, or upgrade path exists
+
+This model offers no protection against:
+- Seed phrase theft (phishing, malware, physical theft)
+- Seed phrase loss (hardware failure, death, disaster)
+- Social engineering attacks
+
+### Why Address Preservation Matters
+
+Users cannot simply "migrate to a better wallet" because:
+
+- .sol domains are tied to their address
+- Exchange whitelists reference their address
+- DAO memberships and governance rights are address-bound
+- NFT provenance and creator royalties reference original addresses
+- Airdrop eligibility is often based on historical address activity
+- Social reputation is tied to on-chain identity
+
+While these associations can technically be updated, the friction is significant:
+
+- .sol domain transfer requires transaction from compromised wallet (impossible if compromised)
+- Exchange whitelists require support tickets and verification delays
+- DAO membership migration may require governance votes
+- NFT provenance is permanently tied to original creator address
+- Airdrop eligibility cannot be retroactively transferred
+- On-chain reputation and history cannot be migrated
+
+Asking users to migrate to a Program Derived Address (PDA) or smart contract wallet means abandoning their established on-chain identity.
+
+### Competitive Landscape
+
+Ethereum has recognized this problem and is actively solving it:
+
+| Standard | Description | Status |
+|----------|-------------|--------|
+| EIP-4337 | Account abstraction via smart contract wallets | Live |
+| EIP-7702 | Allows EOAs to temporarily adopt smart contract code | Shipping with Pectra |
+
+These standards enable Ethereum users to add recovery mechanisms, social guardians, and spending limits to existing addresses.
+
+Solana has no equivalent roadmap. Users creating wallets today have the same security model as users in 2020.
+
+**Note on "Ethereum envy":** This proposal does not suggest Solana should copy Ethereum's approach. The architectures are fundamentally different. However, the user problem is identical across chains, and Solana users deserve a Solana-native solution. The competitive comparison is included to demonstrate industry recognition that this problem requires protocol-level solutions.
+
+### Why Now
+
+- Solana adoption is accelerating across retail and institutional users
+- High-profile wallet compromises continue to make headlines
+- Competing chains are shipping account abstraction features
+- The longer Solana waits, the more users are locked into vulnerable accounts
+- Institutional adoption requires security guarantees beyond "don't lose your seed phrase"
+
+### Why Protocol-Level
+
+A common counterargument is: "Let the market solve it with smart contract wallets."
+
+This proposal argues for protocol-level implementation because:
+
+1. **Application-layer solutions are not enforceable.** Wallet applications can implement guardian checks, but attackers can bypass compliant wallets using CLI tools, custom scripts, or any raw signing tool. The blockchain only validates signatures, not application logic.
+
+2. **Smart contract wallets require migration.** Existing solutions (Squads, Fuse) require users to move to a new address. This proposal enables recovery on existing addresses.
+
+3. **Fragmentation creates confusion.** Multiple competing application-layer solutions create inconsistent user experiences and security guarantees. A protocol-level standard provides uniformity.
+
+4. **Wallet providers can build on protocol primitives.** Rather than each wallet implementing proprietary recovery, all wallets can leverage the same underlying mechanism, reducing development burden and increasing auditability.
+
+### User Stories
+
+**Story 1: Phishing Compromise**
+A user clicks a malicious link and unknowingly signs a transaction that exposes their seed phrase. By the time they realize, their wallet is drained. With a guardian registered, they could have initiated recovery from their secure key wallet, freezing the account and transferring ownership to a new keypair.
+
+**Story 2: Inheritance**
+A user passes away unexpectedly. Their family knows about their crypto holdings but has no access to the seed phrase stored on an encrypted device. With a guardian key held by a trusted family member or attorney, recovery could be initiated after appropriate verification.
+
+**Story 3: Lost Seed Phrase**
+A user's hardware wallet fails and their metal seed backup is destroyed in a house fire. With no guardian, the funds are permanently lost. A registered guardian could recover the account to a new keypair.
+
+**Story 4: Proactive Security**
+A security-conscious user wants defense in depth. They register a guardian key stored on a hardware wallet in a bank safe deposit box. Their daily-use wallet remains convenient, but catastrophic loss is no longer possible.
+
+**Story 5: Institutional Requirement**
+A company treasury requires multi-party control for compliance. Rather than migrating to a multi-sig (new address), they register a guardian key held by the CFO, enabling recovery if the primary operator is unavailable.
+
+---
+
+## New Terminology
+
+| Term | Definition |
+|------|------------|
+| **Guardian** | A secondary keypair registered to a System-owned account with authority to initiate recovery |
+| **Primary Key** | The original keypair that controls the account (standard wallet keypair) |
+| **Key Wallet** | Colloquial term for the wallet holding the guardian keypair |
+| **Transactional Wallet** | Colloquial term for the user's daily-use wallet (primary key) |
+| **Activation Delay** | Mandatory waiting period after guardian registration before the guardian becomes active |
+| **Recovery Timelock** | Mandatory waiting period between recovery initiation and finalization |
+| **Contested State** | Account state during an active recovery attempt |
+| **Recovery Initiation** | Guardian-signed transaction that begins the recovery process |
+| **Recovery Finalization** | Guardian-signed transaction that completes ownership transfer after timelock |
+| **Recovery Cancellation** | Primary key-signed transaction that aborts an active recovery attempt |
+
+---
+
+## Proposed Solution
+
+### High-Level Mechanism
+
+1. A native program (Guardian Registry) is added to the Solana runtime
+2. Users can register a guardian keypair to their existing account
+3. Registration requires signing with the primary key
+4. A mandatory activation delay prevents attackers from racing to register their own guardian
+5. Once active, the guardian can initiate recovery if the primary key is compromised
+6. Recovery includes a timelock during which the primary key can cancel (false alarm protection)
+7. After timelock expires, the guardian can finalize recovery, transferring account ownership to a new keypair
+
+### Design Principles
+
+1. **Minimal scope:** Guardians can only initiate recovery. No spending limits, transaction approval, or other features. Scope creep is explicitly rejected.
+
+2. **Opt-in only:** Zero impact on non-participating accounts.
+
+3. **Self-custodial:** No third-party trust assumptions. Both keys are controlled by the user (or their designated trusted parties).
+
+4. **Reversible:** False alarm recovery attempts can be cancelled by the primary key.
+
+5. **Simple:** One guardian per account (initially). Complexity invites bugs.
+
+### User Flow: Registration
+
+```
+User has existing wallet (Address A, Keypair K1)
+    │
+    ▼
+User generates or designates guardian keypair (Keypair G)
+    │
+    ▼
+User signs RegisterGuardian transaction with K1
+    │
+    ▼
+Guardian registration enters "pending" state
+    │
+    ▼
+Activation delay period begins (e.g., 7 days)
+    │
+    ▼
+Activation delay expires
+    │
+    ▼
+Guardian G is now active for Address A
+```
+
+### User Flow: Recovery (Compromise Scenario)
+
+```
+Primary key K1 is compromised
+    │
+    ▼
+Attacker begins draining funds (or user notices before drain)
+    │
+    ▼
+User accesses guardian wallet (Keypair G)
+    │
+    ▼
+User signs InitiateRecovery(new_keypair K2) with G
+    │
+    ▼
+Account enters "contested" state
+    │
+    ▼
+Outbound transfers frozen
+    │
+    ▼
+Recovery timelock begins (e.g., 3 days)
+    │
+    ▼
+Timelock expires with no cancellation
+    │
+    ▼
+User signs FinalizeRecovery with G
+    │
+    ▼
+Account ownership transfers to K2
+    │
+    ▼
+K1 no longer has authority over Address A
+```
+
+### User Flow: False Alarm
+
+```
+Guardian initiates recovery (mistake or guardian key compromised)
+    │
+    ▼
+Account enters "contested" state
+    │
+    ▼
+User still has access to primary key K1
+    │
+    ▼
+User signs CancelRecovery with K1
+    │
+    ▼
+Recovery attempt aborted
+    │
+    ▼
+Account returns to normal state
+    │
+    ▼
+(Optional) User revokes compromised guardian, registers new one
+```
+
+---
+
+## Alternatives Considered
+
+### Alternative 1: Migrate to Program Derived Addresses (PDAs)
+
+Users could migrate assets to a PDA controlled by a program with recovery logic.
+
+**Why Rejected:**
+- Loses address continuity
+- Breaks .sol domain associations
+- Invalidates exchange whitelists
+- Loses DAO memberships and governance rights
+- Requires moving all assets (gas costs, complexity)
+- Not a solution—just creates a new account
+
+### Alternative 2: Multi-Signature Wallets (Squads, etc.)
+
+Users could migrate to multi-sig accounts requiring multiple signatures.
+
+**Why Rejected:**
+- Same address continuity problems as PDAs
+- Adds friction to every transaction
+- Overkill for individual users wanting simple recovery
+- Coordination overhead for key management
+
+### Alternative 3: Application-Layer Solutions
+
+Wallet applications (Phantom, Backpack) could implement guardian checks.
+
+**Why Rejected:**
+- Not enforceable at protocol level
+- Attacker can use CLI, custom scripts, or non-compliant tools
+- Blockchain only validates signatures, not application logic
+- Security theater, not actual protection
+
+### Alternative 4: Social Recovery via Trusted Services
+
+Third-party services could hold recovery keys on behalf of users.
+
+**Why Rejected:**
+- Introduces custodial trust assumptions
+- Single point of failure moves to the service
+- Service shutdown = loss of recovery ability
+- Defeats the purpose of self-custody
+
+### Alternative 5: Status Quo
+
+Accept that Solana wallets have no recovery mechanism.
+
+**Why Rejected:**
+- Unacceptable user experience
+- Competitive disadvantage vs. Ethereum
+- Continues to expose users to preventable loss
+- Limits institutional adoption
+
+---
+
+## Security Considerations
+
+### Attack Vector 1: Attacker Registers Their Own Guardian First
+
+**Scenario:** Attacker compromises primary key and immediately registers their own guardian before the legitimate user can.
+
+**Mitigation:** Activation delay (e.g., 7 days) before a newly registered guardian becomes active. This gives the legitimate user time to notice unauthorized registration and:
+- Revoke the attacker's guardian registration
+- Register their own guardian
+- Migrate assets if necessary
+
+**Concern raised:** "7 days isn't enough. Sophisticated attackers could wait quietly."
+
+**Response:** The activation delay creates a window, not a guarantee. Users should:
+- Enable wallet notifications for guardian-related transactions
+- Wallet applications should prominently surface guardian registration events
+- 7 days is a starting parameter; governance can adjust based on real-world data
+
+No security measure is absolute. The goal is defense in depth, not perfection.
+
+### Attack Vector 2: Guardian Key Compromise
+
+**Scenario:** The guardian key itself is compromised.
+
+**Mitigation:**
+- Primary key can revoke guardian at any time
+- Primary key can cancel any recovery attempt initiated by compromised guardian
+- Timelock provides window for legitimate user to respond
+- User should store guardian key with higher security than primary key (hardware wallet, safe deposit box, etc.)
+
+**Concern raised:** "You're expanding the attack surface from one key to two."
+
+**Response:** This is a trade-off, not a flaw. Users opting into guardians accept that they now have two keys to protect. However:
+- The guardian key can be stored with extreme security (never online)
+- The primary key compromise alone is no longer catastrophic
+- Net security posture improves for users who implement correctly
+
+Users who prefer single-key simplicity can simply not opt in.
+
+### Attack Vector 3: Front-Running Guardian Registration
+
+**Scenario:** Attacker monitors mempool and tries to front-run legitimate guardian registration.
+
+**Mitigation:**
+- First valid registration wins
+- Activation delay applies regardless
+- User can revoke and re-register if front-run
+
+### Attack Vector 4: Social Engineering During Recovery
+
+**Scenario:** Attacker convinces user to cancel a legitimate recovery attempt.
+
+**Mitigation:**
+- Education and UX design responsibility
+- Wallet applications should clearly display recovery status
+- Out of scope for protocol-level solution
+
+### Attack Vector 5: Concurrent Transactions During Contested State
+
+**Scenario:** Both attacker (with primary key) and user (with guardian) race to move funds or finalize recovery.
+
+**Recommendation:** Freeze outbound transfers upon recovery initiation.
+
+- Account can still receive funds
+- Primary key can cancel recovery to restore normal operation
+- Eliminates the race condition entirely
+
+**Concern raised:** "Freezing is dangerous. What about DeFi positions, liquidations, time-sensitive transactions?"
+
+**Response:** This is a genuine trade-off. Options:
+
+| Model | Behavior | Risk |
+|-------|----------|------|
+| Full freeze | All outbound halted | DeFi positions may be affected |
+| Partial freeze | SOL transfers halted, program interactions allowed | Attacker can still interact with DeFi |
+| No freeze | Race continues | Attacker can drain during timelock |
+
+**Recommended approach:** Full freeze with the following considerations:
+- Recovery should be a rare, emergency event
+- Users in active DeFi positions should factor this into risk assessment
+- 3-day timelock is short enough to limit DeFi exposure
+- Alternative: Governance-tunable freeze scope
+
+This requires further community input. The proposal acknowledges the trade-off rather than pretending it doesn't exist.
+
+### Attack Vector 6: Griefing via Malicious Guardian
+
+**Scenario:** A malicious guardian repeatedly initiates recovery to harass the user and freeze their account.
+
+**Mitigation:**
+- Primary key can revoke guardian at any time
+- After cancellation, user can register a new guardian
+- Repeated abuse is self-limiting (user will revoke)
+
+**Additional consideration:** Should there be a cooldown after cancelled recovery before the same guardian can initiate again? This is an open question for community input.
+
+### Parameter Recommendations
+
+| Parameter | Recommended Value | Rationale |
+|-----------|-------------------|-----------|
+| Activation delay | 7 days | Sufficient time to detect unauthorized registration |
+| Recovery timelock | 3 days | Balance between urgency and dispute window |
+| Max guardians per account | 1 | Simplicity; can be expanded in future proposal |
+
+---
+
+## Backwards Compatibility
+
+This proposal is fully backwards compatible:
+
+- **Opt-in only:** Accounts without registered guardians behave exactly as they do today
+- **No changes to existing transaction flow:** Non-participating accounts experience zero overhead
+- **No migration required:** Users can register guardians on existing accounts (while they still have access)
+- **No breaking changes:** Existing applications, wallets, and tools continue to function
+
+Accounts that never register a guardian are completely unaffected by this proposal.
+
+---
+
+## Drawbacks
+
+### Drawback 1: Validator Overhead
+
+**Concern:** Every transaction must check whether the account has an active guardian and whether a recovery is in progress.
+
+**Severity:** Low to Medium
+
+**Analysis:**
+
+The concern assumes every transaction pays the lookup cost. This is not the proposed design.
+
+**Mitigation approach:**
+- Participating accounts are flagged in account metadata (single bit)
+- Transaction validation checks flag first (negligible cost)
+- Only flagged accounts trigger full guardian lookup
+- Non-participating accounts (expected majority) experience zero overhead
+
+**Performance context:**
+- Ed25519 signature verification already dominates transaction cost
+- One additional registry lookup (for flagged accounts only) is marginal
+- Solana processes 50,000+ TPS; this proposal does not meaningfully impact that ceiling
+
+[TECHNICAL INPUT NEEDED: Benchmarking and performance analysis to validate these claims]
+
+**Request to reviewers:** If performance is a blocking concern, please specify the acceptable overhead threshold so it can be explicitly targeted.
+
+### Drawback 2: State Bloat
+
+**Concern:** Guardian configuration adds data to participating accounts.
+
+**Estimated Size:**
+```
+guardian_pubkey: 32 bytes
+pending_recovery: 40 bytes (optional)
+timelock: 8 bytes
+registered_slot: 8 bytes
+───────────────────────────
+Total: ~88 bytes per participating account
+```
+
+**Severity:** Low
+
+**Analysis:**
+
+At 88 bytes per account:
+- 1 million participating accounts = 88 MB
+- 10 million participating accounts = 880 MB
+
+For context, Solana's current state size is measured in terabytes.
+
+**Mitigation:**
+- Rent requirement means users pay for storage
+- PDA-based registry could store config separately from account data
+- Guardian configs for inactive/empty accounts could be pruned via governance
+
+**Concern raised:** "Rent doesn't cover long-term storage costs."
+
+**Response:** This is a broader concern with Solana's rent model, not specific to this proposal. If rent economics need adjustment, that's a separate SIMD. This proposal follows existing rent conventions.
+
+### Drawback 3: Complexity During Recovery Window
+
+**Concern:** The contested state introduces edge cases around concurrent transactions, cancellation, and finalization.
+
+**Severity:** Medium
+
+**Specific edge cases:**
+
+| Scenario | Concern | Proposed Handling |
+|----------|---------|-------------------|
+| Active stake during recovery | Stake rewards, undelegation | Stake operations frozen during contested state |
+| Open swap/DeFi position | Liquidation risk | Acknowledged trade-off; user accepts risk by opting in |
+| Token accounts | Freeze scope | Guardian applies to System Account only; token accounts follow owner |
+| Program expects writable account | Transaction failure | Programs interacting with contested accounts will fail; expected behavior |
+
+**Mitigation:**
+- Clear state machine with well-defined transitions
+- Freeze model eliminates race conditions
+- Extensive testing on devnet/testnet before mainnet activation
+- Phased rollout with monitoring
+
+[TECHNICAL INPUT NEEDED: Detailed state machine specification and edge case analysis]
+
+### Drawback 4: Cannot Help Already-Compromised or Lost Wallets
+
+**Concern:** Users who have already lost access or been compromised cannot retroactively benefit.
+
+**Severity:** Inherent limitation (not a flaw)
+
+**Response:** This is not solvable by any cryptographic mechanism. The proposal is explicitly proactive. This is clearly communicated to set appropriate expectations.
+
+The proposal still provides value:
+- All current users can opt in while they have access
+- All future users can set up guardians from day one
+- The population of protected users grows over time
+
+### Drawback 5: User Education Required
+
+**Concern:** Users must understand how to set up and manage guardians correctly.
+
+**Severity:** Low
+
+**Mitigation:**
+- Wallet application UX responsibility
+- Clear documentation and best practices
+- Wallet providers can guide users through setup
+- Standard practices will emerge as adoption grows
+
+### Drawback 6: Limited Adoption May Not Justify Overhead
+
+**Concern:** If only 5% of users opt in, the runtime complexity isn't justified.
+
+**Response:**
+
+1. **Overhead is proportional to adoption.** Non-participating accounts have zero overhead. The complexity only affects users who opt in.
+
+2. **Value protected matters more than percentage.** If 5% of users hold 50% of value, protecting that value is worthwhile.
+
+3. **Adoption can grow over time.** Initial adoption may be low, but wallet integration and user education can drive growth.
+
+4. **Institutional adoption requires this.** Even if retail adoption is low, institutional users may require guardian functionality for compliance.
+
+[DATA NEEDED: Survey wallet providers and institutional users on demand]
+
+---
+
+## Addressing Common Objections
+
+### "This isn't a protocol-level problem"
+
+**Objection:** Self-custody means self-responsibility. User key management is a wallet application concern, not a consensus concern.
+
+**Response:** This proposal does not remove self-custody or self-responsibility. Users still control both keys. The protocol simply enables a recovery path that is currently impossible.
+
+Application-layer solutions cannot enforce guardian logic because attackers bypass compliant wallets. Protocol-level enforcement is the only way to make guardians meaningful.
+
+### "Let the market solve it"
+
+**Objection:** Smart contract wallets already exist. Users who want recovery can migrate.
+
+**Response:** Migration requires abandoning the original address. This proposal enables recovery without migration. It's a complementary solution, not a competing one.
+
+Additionally, protocol-level primitives enable the market to build better products. Wallet providers can integrate guardian functionality without each implementing proprietary solutions.
+
+### "You're adding training wheels to a permissionless system"
+
+**Objection:** Part of crypto's ethos is radical self-sovereignty. Protocol-level hand-holding undermines this.
+
+**Response:** This proposal is opt-in. Users who prefer radical self-sovereignty can simply not register a guardian. Their experience is unchanged.
+
+For users who want an additional safety net while maintaining self-custody, this proposal provides that option. Permissionlessness means users can choose their own security model.
+
+### "Solana's value proposition is speed"
+
+**Objection:** Every additional check in transaction validation adds latency.
+
+**Response:** The proposed design adds zero overhead for non-participating accounts (flag check only). For participating accounts, the additional lookup is marginal compared to signature verification.
+
+[TECHNICAL INPUT NEEDED: Benchmarks to validate this claim]
+
+If performance is a blocking concern, please specify the acceptable overhead threshold.
+
+### "Edge cases will cause fund loss"
+
+**Objection:** Complex state machines have bugs. One bug could cause catastrophic loss.
+
+**Response:** This is a valid concern that applies to all protocol changes. Mitigation:
+
+1. Extensive testing on devnet and testnet
+2. Formal verification of state machine (if resources allow)
+3. Phased rollout with monitoring
+4. Bug bounty program
+5. Conservative initial parameters
+
+The alternative—no recovery mechanism—also causes fund loss (and already does, regularly).
+
+### "The users who need this won't use it"
+
+**Objection:** Users who lose seed phrases are not the users who proactively set up guardians.
+
+**Response:** This may be partially true, but:
+
+1. Wallet providers can prompt users during onboarding
+2. Institutional users will proactively configure guardians
+3. Security-conscious users get defense in depth
+4. User education improves over time
+
+Even if adoption is imperfect, protecting some users is better than protecting none.
+
+### "Slippery slope to account abstraction complexity"
+
+**Objection:** If we add guardians, what's next? Spending limits? Transaction approval? This transforms Solana into something it's not.
+
+**Response:** This proposal explicitly rejects scope creep. Guardians do one thing: recovery. The proposal does not include:
+- Spending limits
+- Transaction approval
+- Whitelisted addresses
+- Time-based restrictions
+
+Future proposals may add such features, but they would be separate SIMDs requiring separate review. This proposal is narrowly scoped by design.
+
+### "Core devs have limited bandwidth"
+
+**Objection:** Is this the highest priority improvement?
+
+**Response:** This is a valid prioritization question for core contributors to answer. The proposal is submitted for consideration, not demand.
+
+The argument for prioritization:
+- User fund loss is an ongoing, preventable problem
+- Competitive pressure from Ethereum's AA progress
+- Institutional adoption may be blocked without this
+- The implementation is relatively contained (new native program + flag check)
+
+---
+
+## Detailed Design
+
+[TECHNICAL INPUT NEEDED]
+
+This section requires input from a technical collaborator familiar with:
+- Solana runtime internals
+- Native program development
+- Validator implementation
+- Account data structures
+
+### Areas Requiring Specification
+
+1. **Guardian Registry Program**
+   - Program ID allocation
+   - Instruction set (RegisterGuardian, InitiateRecovery, CancelRecovery, FinalizeRecovery, RevokeGuardian)
+   - Account data structures
+   - PDA derivation (if applicable)
+
+2. **Runtime Changes**
+   - Transaction validation hooks
+   - Contested state enforcement
+   - Freeze mechanics implementation
+   - Flag checking optimization
+
+3. **Account Data Extensions**
+   - How guardian config is stored
+   - Relationship to existing System Account structure
+   - Rent implications
+
+4. **State Machine**
+   - Formal specification of all states and transitions
+   - Error handling
+   - Edge cases
+
+5. **Testing Requirements**
+   - Unit tests
+   - Integration tests
+   - Testnet deployment plan
+   - Phased mainnet rollout
+
+---
+
+## Open Questions
+
+1. Should guardian registration require a fee beyond rent to discourage spam?
+
+2. Should multiple guardians be allowed (e.g., 2-of-3 recovery)? (Recommendation: No, keep v1 simple. Consider for future SIMD.)
+
+3. Should there be a maximum timelock to prevent permanent lock-out via malicious guardian?
+
+4. Should there be a cooldown period after cancelled recovery before the same guardian can initiate again?
+
+5. How should this interact with staking accounts and other non-System accounts?
+
+6. Should the freeze during contested state be total (all outbound) or partial (SOL only, programs allowed)?
+
+7. Should there be an escape hatch if both primary and guardian keys are lost? (Recommendation: No. This would create an attack vector. Loss of both keys means loss of funds, same as today.)
+
+8. What is the acceptable performance overhead threshold for participating accounts?
+
+---
+
+## Implementation Path
+
+### Phase 1: Community Feedback
+- Post to SIMD Ideas discussion
+- Gather feedback from wallet providers (Phantom, Backpack, Solflare)
+- Survey institutional users on demand
+- Identify technical collaborators
+
+### Phase 2: Technical Specification
+- Complete Detailed Design section with technical co-author
+- Performance benchmarking
+- Security audit of design
+
+### Phase 3: Implementation
+- Develop Guardian Registry program
+- Implement runtime changes
+- Comprehensive testing
+
+### Phase 4: Testnet
+- Deploy to testnet
+- Community testing period
+- Bug bounty program
+
+### Phase 5: Mainnet
+- Phased rollout
+- Monitoring and incident response plan
+- Documentation and wallet integration guides
+
+---
+
+## References
+
+- [EIP-4337: Account Abstraction Using Alt Mempool](https://eips.ethereum.org/EIPS/eip-4337)
+- [EIP-7702: Set EOA account code for one transaction](https://eips.ethereum.org/EIPS/eip-7702)
+- [Argent Wallet Guardian System](https://www.argent.xyz/)
+- [Safe (formerly Gnosis Safe) Multi-Signature Architecture](https://safe.global/)
+- [Solana Account Model Documentation](https://docs.solana.com/developing/programming-model/accounts)
